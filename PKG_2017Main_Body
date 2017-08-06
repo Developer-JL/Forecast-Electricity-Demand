@@ -1,0 +1,476 @@
+create or replace PACKAGE BODY PKG_2017Main AS
+
+-- Package:  PKG_2017Main 
+-- Author:   Jian Li
+-- Date:     07-May-2017 
+
+-- Description 
+    -- This package contains procedures and functions which help to do the 
+    -- fllowing tasks:
+    -- Forecast the next two weeks' energy requirements for each TNI, LR, FRMP 
+    -- combination, daily at each half hour interval.
+    -- Produce an XML file that lists the total consumption for each TNI for 
+    -- next day and written it to the /exports/orcloz directory.
+    -- Email the xml file as an attachment.
+    
+-- Modification History
+   -- 07-May-2017 Create LOCAL_RM16 Table, PKG_2017Main specification 
+   --             and PKG_2017Main body.
+   -- 08-May-2017 Add PROCEDURE RM16_forecast and FUNCTION isHoliday.
+   -- 10-May-2017 Add PROCEDURE forecast and setStatementTypeAndChangeDate.
+   -- 15-May-2017 Modify PROCEDURE forecast, add FUNCTION hasHoliday, 
+   --             PROCEDURE forecastNormalDays, forecastHolidays, 
+   --             forecastSpecialHolidays.
+   -- 17-May-2017 Add FUNCTION produceXml and PROCEDURE writeXmlFile.
+   -- 21-May-2017 Create Parameter Table and add PROCEDURE sendMail.
+   -- 26-May-2017 Clean up the code.
+
+-- Forward decleration
+  FUNCTION isHoliday(p_date IN DATE) RETURN BOOLEAN;
+  FUNCTION hasHoliday RETURN BOOLEAN;
+  FUNCTION produceXml RETURN CLOB;
+  FUNCTION get_email_address RETURN VARCHAR2;
+  FUNCTION get_file_name RETURN VARCHAR2;
+  PROCEDURE forecastNormalDays(p_date IN DATE);
+  PROCEDURE forecastHolidays(p_date IN DATE);
+  PROCEDURE forecastSpecialHolidays(p_date IN DATE);
+  PROCEDURE setStatementTypeAndChangeDate;
+  PROCEDURE forecast;
+  PROCEDURE writeXmlFile;
+  PROCEDURE sendMail(p_to          IN VARCHAR2,
+                     p_from        IN VARCHAR2,
+                     p_subject     IN VARCHAR2,
+                     p_message     IN VARCHAR2,
+                     p_attach_name IN VARCHAR2,
+                     p_attach_mime IN VARCHAR2,
+                     p_smtp_host   IN VARCHAR2,
+                     p_smtp_port   IN NUMBER);
+  
+
+-- Main Procedure that forecast the next two weeks' energy requirements,
+-- write the TNI consumption data XML file to /exports/orcloz directory and
+-- email the XML file as an attachment.
+  PROCEDURE RM16_forecast IS
+    
+    v_to VARCHAR2(50);
+    v_attach_name VARCHAR2(50);
+    
+    
+    BEGIN
+      
+      v_to := get_email_address;
+      v_attach_name := get_file_name;
+      
+      
+      forecast;
+      
+      writeXmlFile;
+      
+      sendMail(v_to,
+               con_from,
+               con_subject,
+               con_message,
+               v_attach_name,
+               con_attach_mine,
+               con_smtp_host,
+               con_smtp_port);
+
+    END;
+
+
+-- Function that checks if a given day is a holiday or not.
+  FUNCTION isHoliday(p_date IN DATE) RETURN BOOLEAN IS
+  
+    v_counter NUMBER;
+  
+    BEGIN
+  
+      SELECT COUNT(*) INTO v_counter
+      FROM DBP_HOLIDAY
+      WHERE TRUNC(HOLIDAY_DATE) = TRUNC(p_date);
+    
+      RETURN v_counter > 0;
+    
+    END;
+    
+    
+-- Function that checks if there are holiday electricity consumption data 
+-- in the past. 
+  FUNCTION hasHoliday RETURN BOOLEAN IS
+
+    v_counter NUMBER;
+  
+    BEGIN
+  
+      SELECT COUNT(*) INTO v_counter 
+      FROM v_nem_rm16 v JOIN DBP_HOLIDAY ON trunc(v.DAY) = trunc(HOLIDAY_DATE)
+      WHERE STATEMENT_TYPE <> con_statement_type;
+
+      RETURN v_counter > 0;
+      
+    END;
+    
+
+-- Function that return a file name in a specific format.
+  FUNCTION get_file_name RETURN VARCHAR2 IS
+    
+    v_file_name VARCHAR2(50);
+    
+    BEGIN
+    
+      SELECT USER||'_'||TO_CHAR(SYSDATE + 1, con_day_format)||'.xml' INTO v_file_name FROM DUAL;
+      RETURN v_file_name;
+    
+    END;
+
+    
+-- Procedure that forecasts non-holiday's electricity consumption and insert 
+-- the forecast data into LOCAL_RM16 Table.
+  PROCEDURE forecastNormalDays(p_date IN DATE) IS 
+    
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    
+    BEGIN
+
+      INSERT INTO LOCAL_RM16(TNI, FRMP, LR, DAY, HH, VOLUME)
+      SELECT  TNI,
+              FRMP,
+              LR,
+              TO_CHAR(TRUNC(p_date), con_day_format),
+              HH,
+              AVG(VOLUME)
+      FROM v_nem_rm16 v
+      WHERE TO_CHAR(TRUNC(DAY),con_day_in_week) = TO_CHAR(TRUNC(p_date),con_day_in_week)
+      AND STATEMENT_TYPE <> con_statement_type 
+      AND TRUNC(v.DAY) NOT IN (SELECT TRUNC(HOLIDAY_DATE) FROM DBP_HOLIDAY)
+      GROUP BY TNI,
+              FRMP,
+              LR,
+              TO_CHAR(trunc(p_date), con_day_format),
+              HH;
+      
+      setStatementTypeAndChangeDate;        
+      COMMIT;
+      Common.log('Finish forecasting NormalDays '||p_date);
+              
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in forecastNormalDays '||p_date||' with '||SQLERRM);
+        ROLLBACK;
+  
+    END;
+    
+
+-- Procedure that forecasts holidays'(which has holiday electricity consumption 
+-- data in the past) electricity consumption and insert 
+-- the forecast data into LOCAL_RM16 Table.
+  PROCEDURE forecastHolidays(p_date IN DATE) IS 
+    
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    
+    BEGIN
+
+      INSERT INTO LOCAL_RM16(TNI, FRMP, LR, DAY, HH, VOLUME)
+      SELECT  TNI,
+              FRMP,
+              LR,
+              TO_CHAR(TRUNC(p_date), con_day_format),
+              HH,
+              AVG(VOLUME)
+      FROM v_nem_rm16 v JOIN DBP_HOLIDAY ON TRUNC(v.DAY) = TRUNC(HOLIDAY_DATE)
+      WHERE STATEMENT_TYPE <> con_statement_type 
+      GROUP BY TNI,
+              FRMP,
+              LR,
+              TO_CHAR(TRUNC(p_date), con_day_format),
+              HH;
+              
+      setStatementTypeAndChangeDate;        
+      COMMIT;
+      Common.log('Finish forecasting Holidays '||p_date);
+              
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in forecastHolidays '||p_date||' with '||SQLERRM);
+        ROLLBACK;
+  
+    END;
+
+
+-- Procedure that forecasts holidays'(which don't have holiday electricity 
+-- consumption data in the past, and use past Sundays' consumption data) 
+-- electricity consumption and insert the forecast data into LOCAL_RM16 Table.
+  PROCEDURE forecastSpecialHolidays(p_date IN DATE) IS 
+
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    
+    BEGIN
+
+      INSERT INTO LOCAL_RM16(TNI, FRMP, LR, DAY, HH, VOLUME)
+      SELECT  TNI,
+              FRMP,
+              LR,
+              TO_CHAR(TRUNC(p_date), con_day_format),
+              HH,
+              AVG(VOLUME)
+      FROM v_nem_rm16
+      WHERE STATEMENT_TYPE <> con_statement_type 
+      AND TO_CHAR(trunc(DAY),'D') = con_day
+      GROUP BY TNI,
+              FRMP,
+              LR,
+              TO_CHAR(TRUNC(p_date), con_day_format),
+              HH;
+              
+      setStatementTypeAndChangeDate;        
+      COMMIT;
+      Common.log('Finish forecasting SpecialHolidays '||p_date);
+              
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in forecastSpecialHolidays '||p_date||' with '||SQLERRM);
+        ROLLBACK;
+  
+    END;
+    
+
+-- Procedure that updates LOCAL_RM16 Table's STATEMENT_TYPE column to 
+-- 'FORECAST' and CHANGE_DATE column to system date. 
+  PROCEDURE setStatementTypeAndChangeDate IS
+
+    BEGIN
+
+        UPDATE LOCAL_RM16
+        SET STATEMENT_TYPE = con_statement_type, 
+        CHANGE_DATE = SYSDATE
+        WHERE STATEMENT_TYPE IS NULL AND CHANGE_DATE IS NULL;
+
+    END;
+    
+
+-- Procedure that forecasts electricity consumption data for next 14 days 
+-- based on different situation, insert the forecast data into LOCAL_RM16 
+-- Table and update the CHANGE_DATE and STATEMENT_TYPE.
+  PROCEDURE forecast IS
+
+    BEGIN
+
+      FOR i IN 1..con_forecast_days LOOP
+    
+        IF NOT isHoliday(SYSDATE + i)
+        THEN
+         
+          forecastNormalDays(SYSDATE + i);
+         
+        ELSIF hasHoliday
+        THEN 
+      
+          forecastHolidays(SYSDATE + i);
+        
+        ELSE
+      
+          forecastSpecialHolidays(SYSDATE + i);
+        
+        END IF;
+                          
+      END LOOP;
+      
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in forecast loop with '||SQLERRM);
+
+    END;
+  
+  
+ -- Procedure that write the TNI consumption data XML file to 
+ -- /exports/orcloz directory.
+ PROCEDURE writeXmlFile IS 
+ 
+    v_filePointer utl_file.file_type;
+    v_utlFileName VARCHAR2(35);
+    v_consumption_xml CLOB;
+  
+    BEGIN
+    
+      v_utlFileName := get_file_name;
+      v_consumption_xml := produceXml;
+      v_filePointer := utl_file.fopen(con_utlDir, v_utlFileName, 'W');
+      utl_file.put_line(v_filePointer, v_consumption_xml);
+      utl_file.fclose(v_filePointer);
+      Common.log('Finshing writing xml flie to system!');
+      
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in writeXmlFile with '||SQLERRM);
+    
+    END;
+    
+  
+ -- Function that returns an CLOB which contains XML file data that lists the 
+ -- total consumption for each TNI for next day.
+ FUNCTION produceXml RETURN CLOB IS 
+ 
+    v_ctx               DBMS_XMLGEN.ctxHandle;
+    v_xml               CLOB := NULL;
+    v_temp_xml          CLOB := NULL;
+    v_query             VARCHAR2(2000) := 'SELECT TNI, SUM(VOLUME) TNI_TOTAL 
+                              FROM LOCAL_RM16
+                              WHERE TRUNC(DAY) = TRUNC(SYSDATE + '||con_number_of_days||')
+                              GROUP BY TNI';
+    BEGIN
+                             
+        v_ctx := DBMS_XMLGEN.newContext(v_query);
+        DBMS_XMLGen.setRowsetTag( v_ctx, 'Consumptions' );
+        DBMS_XMLGen.setRowTag( v_ctx, 'Consumption' );
+        v_temp_xml := DBMS_XMLGEN.getXML(v_ctx);
+
+        IF v_temp_xml IS NOT NULL THEN
+            IF v_xml IS NOT NULL THEN
+                DBMS_LOB.APPEND( v_xml, v_temp_xml );
+            ELSE
+                v_xml := v_temp_xml;
+            END IF;
+        END IF;
+
+        DBMS_XMLGEN.closeContext( v_ctx );
+        RETURN v_xml;
+        
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in produceXml with '||SQLERRM);
+        v_xml := 'Error occured in produceXml with '||SQLERRM;
+        RETURN v_xml;
+        
+    END;
+    
+    
+-- Procedure that change the email address of where the XML file send to in
+-- Parameter Table.
+  PROCEDURE change_email_address(p_email_address IN VARCHAR2) IS
+
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    
+    BEGIN
+    
+        UPDATE PARAMETER
+        SET VALUE = p_email_address
+        WHERE KIND = 'EMAIL_ADDRESS' AND CODE = 'ASSGN_RECIPIENT';
+        COMMIT;
+        Common.log('Change EMAIL_ADDRESS to '||p_email_address);
+        
+    EXCEPTION
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in change_email_address with '||SQLERRM);
+    
+    END;
+    
+    
+-- Function that get the email address of where the XML file send to from 
+-- Parameter Table and return it.
+  FUNCTION get_email_address RETURN VARCHAR2 IS
+    
+    v_email_address VARCHAR2(50);
+    
+    BEGIN
+      
+      SELECT VALUE INTO v_email_address 
+      FROM PARAMETER WHERE KIND = 'EMAIL_ADDRESS' AND CODE = 'ASSGN_RECIPIENT';
+      
+      RETURN v_email_address;
+      
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+      
+        Common.log('No data found in get_email_address with '||SQLERRM);
+        RETURN con_default_email_address;      
+      
+      WHEN TOO_MANY_ROWS THEN
+      
+        Common.log('Too many rows found in get_email_address with '||SQLERRM);
+        RETURN con_default_email_address; 
+      
+      WHEN OTHERS THEN
+        
+        Common.log('Error occured in get_email_address with '||SQLERRM);
+        RETURN con_default_email_address;
+    
+    END;
+    
+    
+-- Procedure that email the xml file that lists the total consumption for each 
+-- TNI for next dayas an attachment.
+-- This procedure takes the below souce as an example: 
+-- https://oracle-base.com/articles/misc/email-from-oracle-plsql
+  PROCEDURE sendMail(p_to          IN VARCHAR2,
+                     p_from        IN VARCHAR2,
+                     p_subject     IN VARCHAR2,
+                     p_message     IN VARCHAR2,
+                     p_attach_name IN VARCHAR2,
+                     p_attach_mime IN VARCHAR2,
+                     p_smtp_host   IN VARCHAR2,
+                     p_smtp_port   IN NUMBER) IS
+
+    v_mail_conn   UTL_SMTP.connection;    
+    v_attach_clob CLOB := produceXml;
+  
+    BEGIN
+ 
+      v_mail_conn := UTL_SMTP.open_connection(p_smtp_host, p_smtp_port);
+      UTL_SMTP.helo(v_mail_conn, p_smtp_host);
+      UTL_SMTP.mail(v_mail_conn, p_from);
+      UTL_SMTP.rcpt(v_mail_conn, p_to);
+
+      UTL_SMTP.open_data(v_mail_conn);
+  
+      UTL_SMTP.write_data(v_mail_conn, 'Date: ' || TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS') || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'To: ' || p_to || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'From: ' || p_from || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'Subject: ' || p_subject || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'Reply-To: ' || p_from || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'MIME-Version: 1.0' || UTL_TCP.crlf);
+      UTL_SMTP.write_data(v_mail_conn, 'Content-Type: multipart/mixed; boundary="' || con_boundary || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+  
+      IF p_message IS NOT NULL THEN
+        UTL_SMTP.write_data(v_mail_conn, '--' || con_boundary || UTL_TCP.crlf);
+        UTL_SMTP.write_data(v_mail_conn, 'Content-Type: text/plain; charset="iso-8859-1"' || UTL_TCP.crlf || UTL_TCP.crlf);
+
+        UTL_SMTP.write_data(v_mail_conn, p_message);
+        UTL_SMTP.write_data(v_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+      END IF;
+
+      IF p_attach_name IS NOT NULL THEN
+        UTL_SMTP.write_data(v_mail_conn, '--' || con_boundary || UTL_TCP.crlf);
+        UTL_SMTP.write_data(v_mail_conn, 'Content-Type: ' || p_attach_mime || '; name="' || p_attach_name || '"' || UTL_TCP.crlf);
+        UTL_SMTP.write_data(v_mail_conn, 'Content-Disposition: attachment; filename="' || p_attach_name || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+ 
+      FOR i IN 0 .. TRUNC((DBMS_LOB.getlength(v_attach_clob) - 1 )/con_step) LOOP
+        UTL_SMTP.write_data(v_mail_conn, DBMS_LOB.substr(v_attach_clob, con_step, i * con_step + 1));
+      END LOOP;
+
+        UTL_SMTP.write_data(v_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+      END IF;
+  
+      UTL_SMTP.write_data(v_mail_conn, '--' || con_boundary || '--' || UTL_TCP.crlf);
+      UTL_SMTP.close_data(v_mail_conn);
+
+      UTL_SMTP.quit(v_mail_conn);
+      Common.log('Send email to '||p_to);
+      
+    EXCEPTION
+      WHEN OTHERS THEN
+      
+      Common.log('Error occured in send_email with '||SQLERRM); 
+      UTL_SMTP.close_data(v_mail_conn);
+      UTL_SMTP.quit(v_mail_conn);
+      
+    END;
+
+
+end PKG_2017Main;
