@@ -1,0 +1,56 @@
+create or replace package PKG_2017Main as
+--
+-- Package:  PKG_2017Main 
+-- Author:   Jian Li
+-- Date:     07-May-2017 
+
+-- Description
+    -- This package contains procedures and functions which help to do the 
+    -- fllowing tasks:
+    -- Forecast the next two weeks' energy requirements for each TNI, LR, FRMP 
+    -- combination, daily at each half hour interval.
+    -- Produce an XML file that lists the total consumption for each TNI for 
+    -- next day and written it to the /exports/orcloz directory.
+    -- Email the xml file as an attachment.
+    
+-- Modification History
+   -- 07-May-2017 Create LOCAL_RM16 Table, PKG_2017Main specification 
+   --             and PKG_2017Main body.
+   -- 08-May-2017 Add PROCEDURE RM16_forecast and FUNCTION isHoliday.
+   -- 10-May-2017 Add PROCEDURE forecast and setStatementTypeAndChangeDate.
+   -- 15-May-2017 Modify PROCEDURE forecast, add FUNCTION hasHoliday, 
+   --             PROCEDURE forecastNormalDays, forecastHolidays, 
+   --             forecastSpecialHolidays.
+   -- 17-May-2017 Add FUNCTION produceXml and PROCEDURE writeXmlFile.
+   -- 21-May-2017 Create Parameter Table and add PROCEDURE sendMail.
+   -- 26-May-2017 Clean up the code.
+  
+-- Constants
+  con_forecast_days  NUMBER := 14; -- How many days to forecast into future.
+  con_day  NUMBER := 7;            -- Sunday
+  con_day_format VARCHAR2(35) := 'DD-MON-YYYY';
+  con_utlDir VARCHAR2(35) := 'DIR_12459513';
+  con_number_of_days  NUMBER := 1;  -- Number of days into future for xml file.
+  con_statement_type  VARCHAR2(35) := 'FORECAST';
+  con_day_in_week  VARCHAR2(35) := 'Day';
+  
+-- Email stuff  
+  con_boundary    VARCHAR2(50) := '------***** (Jerry) Jian LI *****------';
+  con_step        PLS_INTEGER  := 12000; 
+  con_smtp_port   NUMBER := 25;
+  con_smtp_host   VARCHAR2(50) := 'postoffice.uts.edu.au';
+  con_from        VARCHAR2(50) := 'Jerry@uts.edu.au';
+  con_subject     VARCHAR2(50) := 'Forecast data for tomorrow';
+  con_message     VARCHAR2(500) := 'Hi Laurie, I have attached forecast data of total consumption for each TNI for tomorrow, please have a look.
+                                   Best Regards
+                                   Jerry';
+  con_attach_mine VARCHAR2(50) := 'text/plain';
+  con_default_email_address VARCHAR2(50) := 'aoaoaizhs@gmail.com';
+
+   
+-- Define the public interface 
+
+PROCEDURE RM16_forecast;
+PROCEDURE change_email_address(p_email_address IN VARCHAR2);
+                         
+end PKG_2017Main;
